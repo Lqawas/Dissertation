@@ -1,0 +1,404 @@
+###########################################################################
+# Complete Analysis Workflow for eDNA Data
+###########################################################################
+# This script performs:
+# 1. Data Preprocessing & Cleaning
+# 2. Reshaping to create a species-level abundance matrix and sample metadata
+# 3. Alpha Diversity Analysis (Richness, Shannon, Simpson) & Boxplots
+# 4. Beta Diversity Analysis (Bray–Curtis dissimilarity, NMDS, PCoA, PERMANOVA)
+# 5. Differential Abundance Analysis using DESeq2
+# 6. Visualization: Volcano Plot and Top 20 Bar Plot for Differential Abundance
+###########################################################################
+
+# ----- SET YOUR WORKING DIRECTORY AS NEEDED -----
+# setwd("path/to/your/working/directory")
+
+# ----------------------------
+# Load Required Libraries
+# ----------------------------
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("vegan")) install.packages("vegan")
+if (!require("pheatmap")) install.packages("pheatmap")
+if (!require("RColorBrewer")) install.packages("RColorBrewer")
+if (!require("DESeq2")) {
+  if (!require("BiocManager")) install.packages("BiocManager")
+  BiocManager::install("DESeq2")
+}
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("ggrepel")) install.packages("ggrepel")
+if (!require("randomForest")) install.packages("randomForest")
+library(tidyverse)
+library(vegan)
+library(pheatmap)
+library(RColorBrewer)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(randomForest)
+
+# Define a custom color palette for groups
+custom_palette <- c("CFA" = "#fcae91", "CFC" = "#66c2a5")
+
+# ----------------------------
+# Section 1: Data Preprocessing & Cleaning
+# ----------------------------
+# Assume raw data is stored in 'data' with columns: domain, phylum, class, order,
+# family, genus, species, CFA1, CFA2, CFA3, CFC1, CFC2, CFC3.
+# Remove "%" symbols and convert abundance columns to numeric.
+data_clean <- data %>% 
+  mutate(across(c(CFA1, CFA2, CFA3, CFC1, CFC2, CFC3), 
+                ~ as.numeric(gsub("%", "", .))))
+
+# ----------------------------
+# Section 2: Reshape Data & Construct Abundance Matrix and Metadata
+# ----------------------------
+# Pivot the data to long format and add a Group column based on sample names.
+data_long <- data_clean %>% 
+  pivot_longer(cols = starts_with("CFA") | starts_with("CFC"),
+               names_to = "Sample",
+               values_to = "Abundance") %>% 
+  mutate(Group = ifelse(grepl("^CFA", Sample), "CFA", "CFC"))
+
+# Create a species-level abundance matrix: rows = samples, columns = species.
+abund_matrix <- data_long %>% 
+  select(Sample, species, Abundance) %>% 
+  group_by(Sample, species) %>% 
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>% 
+  pivot_wider(names_from = species, values_from = Abundance, values_fill = 0)
+
+# Create sample metadata (unique Sample and Group)
+metadata <- data_long %>% 
+  select(Sample, Group) %>% 
+  distinct()
+
+# Convert the abundance matrix to a data frame and set rownames.
+abund_matrix_df <- as.data.frame(abund_matrix)
+rownames(abund_matrix_df) <- abund_matrix_df$Sample
+abund_matrix_df <- abund_matrix_df[, -1]
+
+# ----------------------------
+# Section 3: Alpha Diversity Analysis
+# ----------------------------
+# Compute species richness, Shannon, and Simpson diversity indices.
+richness <- specnumber(abund_matrix_df)
+shannon  <- vegan::diversity(abund_matrix_df, "shannon")
+simpson  <- vegan::diversity(abund_matrix_df, "simpson")
+
+alpha_div <- data.frame(
+  Sample = rownames(abund_matrix_df),
+  Richness = richness,
+  Shannon  = shannon,
+  Simpson  = simpson
+) %>% left_join(metadata, by = "Sample")
+
+# Display Shannon and Simpson boxplots (grid lines removed).
+shannon_plot <- ggplot(alpha_div, aes(x = Group, y = Shannon, fill = Group)) +
+  geom_boxplot(notch = FALSE, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+  labs(title = "Shannon Diversity Index", x = "Group", y = "Shannon Index") +
+  scale_fill_manual(values = custom_palette) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", size = 0.5),
+        plot.title = element_text(hjust = 0.5))
+
+simpson_plot <- ggplot(alpha_div, aes(x = Group, y = Simpson, fill = Group)) +
+  geom_boxplot(notch = FALSE, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+  labs(title = "Simpson Diversity Index", x = "Group", y = "Simpson Index") +
+  scale_fill_manual(values = custom_palette) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", size = 0.5),
+        plot.title = element_text(hjust = 0.5))
+
+print(shannon_plot)
+print(simpson_plot)
+
+# ----------------------------
+# Section 4: Beta Diversity Analysis
+# ----------------------------
+# Compute Bray–Curtis dissimilarity
+bray_dist <- vegdist(abund_matrix_df, method = "bray")
+
+# NMDS ordination
+nmds <- metaMDS(bray_dist, k = 2, trymax = 100)
+nmds_df <- as.data.frame(scores(nmds))
+nmds_df$Sample <- rownames(nmds_df)
+nmds_df <- left_join(nmds_df, metadata, by = "Sample")
+
+nmds_plot <- ggplot(nmds_df, aes(x = NMDS1, y = NMDS2, color = Group)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  labs(title = "NMDS Ordination", x = "NMDS1", y = "NMDS2") +
+  scale_color_manual(values = custom_palette) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", size = 0.5),
+        plot.title = element_text(hjust = 0.5))
+
+print(nmds_plot)
+
+# PCoA ordination
+pcoa <- cmdscale(bray_dist, k = 2, eig = TRUE)
+pcoa_df <- data.frame(
+  PC1 = pcoa$points[, 1],
+  PC2 = pcoa$points[, 2],
+  Sample = rownames(pcoa$points)
+)
+pcoa_df <- left_join(pcoa_df, metadata, by = "Sample")
+
+# PERMANOVA test on Bray-Curtis dissimilarity.
+permanova <- adonis2(bray_dist ~ Group, data = metadata)
+pval <- permanova$`Pr(>F)`[1]
+
+pcoa_plot <- ggplot(pcoa_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  labs(title = "PCoA Ordination",
+       subtitle = paste("PERMANOVA p =", signif(pval, digits = 3)),
+       x = "PC1", y = "PC2") +
+  scale_color_manual(values = custom_palette) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", size = 0.5),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(size = 10, color = "black"))
+
+print(pcoa_plot)
+
+# ----------------------------
+# Section 5: Differential Abundance Analysis using DESeq2
+# ----------------------------
+# Convert abundance values (percentages) to pseudo-counts: multiply by 1e6 and add 1.
+pseudo_counts <- round(abund_matrix_df * 1e6) + 1
+# DESeq2 expects rows = species, columns = samples, so transpose if needed.
+pseudo_counts <- t(pseudo_counts)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = pseudo_counts,
+  colData = metadata,
+  design = ~ Group
+)
+dds <- DESeq(dds)
+res <- results(dds)
+res_df <- as.data.frame(res)
+res_df$Species <- rownames(res_df)
+write.csv(res_df, " DESeq2_Viridiplantae_results.csv", row.names = TRUE)
+
+# Volcano Plot: Plot all species with point colors based on sign,
+# label only those with padj < 0.01 and |log2FoldChange| > 1.
+res_df_noNA <- res_df %>% filter(!is.na(log2FoldChange), !is.na(padj))
+volcano_plot <- ggplot(res_df_noNA, aes(x = log2FoldChange, y = -log10(padj),
+                                         color = log2FoldChange > 0)) +
+  geom_point(alpha = 0.8) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray40") +
+  geom_text_repel(data = subset(res_df_noNA, padj < 0.01 & abs(log2FoldChange) > 1),
+                  aes(label = Species),
+                  size = 3, max.overlaps = Inf, box.padding = 0.3, point.padding = 0.2,
+                  segment.color = "gray50") +
+  scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "orange"),
+                     labels = c("FALSE" = "Higher in CFA", "TRUE" = "Higher in CFC")) +
+  labs(title = "Volcano Plot of Differential Abundance", x = "Log2 Fold Change",
+       y = "-Log10 Adjusted p-value", color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", size = 0.5),
+        plot.title = element_text(hjust = 0.5))
+print(volcano_plot)
+
+# Bar Plot: Top 20 species by absolute log2FoldChange
+top20 <- res_df_noNA %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  slice_head(n = 20) %>%
+  mutate(Species = factor(Species, levels = rev(Species)),
+         GroupLabel = ifelse(log2FoldChange > 0, "Higher in CFC", "Higher in CFA"))
+bar_plot <- ggplot(top20, aes(x = Species, y = log2FoldChange, fill = GroupLabel)) +
+  geom_col(show.legend = TRUE) +
+  scale_y_continuous(limits = c(-20, 20)) +
+  coord_flip() +
+  labs(title = "Top 20 Differentially Abundant Viridiplantae Species",
+       x = "Species", y = "Log2 Fold Change", fill = NULL) +
+  scale_fill_manual(values = c("Higher in CFC" = "blue", "Higher in CFA" = "orange")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", size = 0.5),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.box = "vertical")
+print(bar_plot)
+ 
+# install.packages(c("MLmetrics","caret"))  # if you don’t already have them
+library(MLmetrics)
+library(caret)
+
+# 1) Define your confusion matrix for South_RGB_DL
+cm <- matrix(c(
+  143,   1,  3,  9,    # Water
+    0, 145,  5, 11,    # Algae
+    0,  13, 97, 24,    # Sphagnum
+    7,  14, 17, 92     # Higher Plants
+), nrow = 4, byrow = TRUE)
+rownames(cm) <- colnames(cm) <- c("Water","Algae","Sphagnum","Higher Plants")
+
+# 2) Reconstruct the per‐sample labels
+y_true <- unlist(lapply(rownames(cm),
+                        function(cl) rep(cl, sum(cm[cl, ]))))
+y_pred <- unlist(lapply(rownames(cm), function(cl) {
+  preds <- colnames(cm)
+  counts <- cm[cl, ]
+  rep(preds, counts)
+}))
+
+# 3) Define a helper to compute all four metrics on a pair of vectors
+compute_metrics <- function(y_true, y_pred) {
+  acc    <- mean(y_true == y_pred)
+  # Macro-F1
+  f1s    <- sapply(levels(factor(y_true)), function(cl) {
+    MLmetrics::F1_Score(y_true == cl, y_pred == cl,
+                        positive = "TRUE")
+  })
+  macroF1 <- mean(f1s)
+  # Weighted-F1
+  support <- table(y_true)[levels(factor(y_true))]
+  weightedF1 <- sum(f1s * support) / length(y_true)
+  # MCC
+  mcc    <- MLmetrics::MatthewsCorrCoef(y_true, y_pred)
+  c(Accuracy = acc,
+    MacroF1  = macroF1,
+    WeightedF1 = weightedF1,
+    MCC      = mcc)
+}
+
+# 4) Bootstrap
+set.seed(123)
+B <- 2000
+N <- length(y_true)
+boot_res <- replicate(B, {
+  idx <- sample(N, replace = TRUE)
+  compute_metrics(y_true[idx], y_pred[idx])
+})
+
+# 5) Build summary and CIs
+orig <- compute_metrics(y_true, y_pred)
+ci_lower <- apply(boot_res, 1, quantile, probs = 0.025)
+ci_upper <- apply(boot_res, 1, quantile, probs = 0.975)
+
+# 6) Display results
+res <- data.frame(
+  Metric    = names(orig),
+  Estimate  = round(orig,  3),
+  CI_2.5    = round(ci_lower, 3),
+  CI_97.5   = round(ci_upper, 3)
+)
+print(res)
+ 
+# 0. INSTALL & LOAD PACKAGES ----------------------------------------------
+required_pkgs <- c(
+  "tidyverse",    # dplyr, ggplot2, tidyr, etc.
+  "readxl",       # read_excel()
+  "FSA",          # dunnTest()
+  "rcompanion",   # cldList()
+  "multcompView", # multcompLetters()
+  "ggpubr"        # theme_pubr()
+)
+new_pkgs <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if(length(new_pkgs)) install.packages(new_pkgs)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+# 1. READ & PREPARE DATA --------------------------------------------------
+raw <- read_excel(
+  path  = "”
+  sheet = "Sheet1"
+)
+
+data <- raw %>%
+  filter(Class == "Algae") %>%              # keep only algae rows
+  rename(AlgaePercent = Percentage_Cover) %>%
+  mutate(
+    Area         = factor(Area),
+    Year         = factor(Year),            # ensure Year is a factor
+    AlgaePercent = as.numeric(AlgaePercent)
+  )
+
+# 2. KRUSKAL–WALLIS & DUNN FOR YEAR ---------------------------------------
+kw_year <- kruskal.test(AlgaePercent ~ Year, data = data)
+dunn_year <- dunnTest(
+  AlgaePercent ~ Year,
+  data   = data,
+  method = "bh"
+)
+
+# 3. COMPACT‐LETTER DISPLAY & STATS ---------------------------------------
+# turn BH-adjusted p’s into letters
+pvals_yr  <- setNames(dunn_year$res$P.adj, dunn_year$res$Comparison)
+cld_vec   <- multcompLetters(pvals_yr, threshold = 0.05)$Letters
+cld_yr_df <- tibble(
+  Comparison = names(cld_vec),
+  Letter     = unname(cld_vec)
+) %>%
+  separate(Comparison, into = c("A","B"), sep = " - ") %>%
+  pivot_longer(c(A,B), values_to = "Year") %>%
+  select(Year, Letter) %>%
+  distinct()
+
+# compute box‐stats by Year
+stats_yr <- data %>%
+  group_by(Year) %>%
+  summarise(
+    ymin   = min(AlgaePercent, na.rm = TRUE),
+    lower  = quantile(AlgaePercent, 0.25, na.rm = TRUE),
+    middle = median(AlgaePercent, na.rm = TRUE),
+    upper  = quantile(AlgaePercent, 0.75, na.rm = TRUE),
+    ymax   = max(AlgaePercent, na.rm = TRUE),
+    mean   = mean(AlgaePercent, na.rm = TRUE)
+  ) %>%
+  left_join(cld_yr_df, by = "Year")
+
+# 4. BOXPLOT BY YEAR -------------------------------------------------------
+p_year_box <- ggplot(data, aes(x = Year, y = AlgaePercent, fill = Year)) +
+  geom_boxplot(outlier.shape = 16, coef = 1.5, width = 0.6) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 1) +
+  geom_text(
+    data = stats_yr,
+    aes(
+      x     = Year,
+      y     = ymax + 0.05 * (max(stats_yr$ymax) - min(stats_yr$ymin)),
+      label = Letter
+    ),
+    vjust = 0, size = 5
+  ) +
+  annotate(
+    "text",
+    x     = Inf, y = Inf,
+    label = paste0("p = ", signif(kw_year$p.value, 2)),
+    hjust = 1.1, vjust = 1.5,
+    size  = 5
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Algae Percent Cover by Year (Boxplot)",
+    x     = "Year",
+    y     = "Percent Cover (%)"
+  ) +
+  theme_pubr(legend = "none") +
+  theme(
+    plot.title       = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title       = element_text(size = 14),
+    axis.text        = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line        = element_line(color = "black")
+  )
+
+print(p_year_box)
+
+
